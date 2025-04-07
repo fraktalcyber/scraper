@@ -1,0 +1,21 @@
+{
+  "name": "web-domain-scanner",
+  "version": "1.0.0",
+  "description": "A high-performance web scraper for extracting external JavaScript sources from websites",
+  "type": "module",
+  "main": "scan-domains-playwright.js",
+  "scripts": {
+    "scan": "node scan-domains-playwright.js",
+    "batch-scan": "bash batch-run.sh"
+  },
+  "dependencies": {
+    "commander": "^11.0.0",
+    "p-queue": "^7.3.4",
+    "pino": "^8.14.1",
+    "playwright": "^1.35.1",
+    "sqlite3": "^5.1.6"
+  },
+  "engines": {
+    "node": ">=14.8.0"
+  }
+}
