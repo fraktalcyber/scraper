@@ -61,9 +61,23 @@ program
   .option('--block-types <types>', 'Comma-separated list of resource types to block (image,font,stylesheet,media)', 'image,font,media')
   .option('--stdout', 'Output results to stdout instead of the database')
   .option('--output-format <format>', 'Format for stdout output: json, csv, or text', 'json')
+  .option('--screenshot', 'Take screenshots of visited pages')
+  .option('--screenshot-format <format>', 'Screenshot format: png or jpeg', 'png')
+  .option('--screenshot-path <path>', 'Directory to save screenshots', './screenshots')
+  .option('--screenshot-full-page', 'Capture full page screenshots, not just viewport')
   .parse(process.argv);
 
 const opts = program.opts();
+
+/**
+ * Ensure screenshot directory exists
+ */
+function ensureScreenshotDirectory(dir) {
+  if (!fs.existsSync(dir)) {
+    logger.info(`Creating screenshot directory: ${dir}`);
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
 
 /*
  * Signal Handling for Graceful Termination
@@ -117,6 +131,7 @@ function initDb(dbPath) {
         finalUrl TEXT,
         success INTEGER NOT NULL,  -- 1=success,0=fail
         error TEXT,
+        screenshotPath TEXT,
         scannedAt DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -205,6 +220,7 @@ async function scanDomain(domain, browserPool, maxRetries = 3, options = {}) {
           success: false,
           error: err.message,
           finalUrl: null,
+          screenshotPath: null,
           resources: [],
         };
       }
@@ -223,6 +239,12 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
 
   const urlObj = new URL(raw);
   const finalUrlToVisit = urlObj.toString();
+
+  // Parse screenshot options
+  const takeScreenshot = options.takeScreenshot || false;
+  const screenshotFormat = options.screenshotFormat || 'png';
+  const screenshotPath = options.screenshotPath || './screenshots';
+  const fullPageScreenshot = options.fullPageScreenshot || false;
 
   const context = await browserPool.acquireContext();
   const page = await context.newPage();
@@ -261,6 +283,34 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
     });
     const finalPageUrl = page.url();
     const finalHostname = new URL(finalPageUrl).hostname.toLowerCase();
+    
+    // Take screenshot if enabled
+    let screenshotFilePath = null;
+    if (takeScreenshot) {
+      try {
+        // Create a timestamped filename
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const sanitizedDomain = domain.replace(/[^a-zA-Z0-9]/g, '_');
+        const filename = `${sanitizedDomain}_${timestamp}.${screenshotFormat}`;
+        screenshotFilePath = path.join(screenshotPath, filename);
+        
+        // Take the screenshot
+        await page.screenshot({
+          path: screenshotFilePath,
+          fullPage: fullPageScreenshot,
+          type: screenshotFormat
+        });
+        
+        logger.info(`Screenshot saved to: ${screenshotFilePath}`);
+      } catch (screenshotErr) {
+        logger.error({
+          msg: 'Failed to take screenshot',
+          domain,
+          error: screenshotErr.message
+        });
+        screenshotFilePath = null;
+      }
+    }
 
     // Collect additional DOM resources if needed
     if (captureTypes.includes('script')) {
@@ -307,6 +357,7 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
       success: true,
       error: null,
       finalUrl: finalPageUrl,
+      screenshotPath: screenshotFilePath,
       resources,
     };
   } catch (err) {
@@ -335,17 +386,17 @@ function handleStdoutOutput(result, format = 'json') {
     case 'csv':
       // Print CSV header if this is the first result
       if (!handleStdoutOutput.headerPrinted) {
-        console.log('domain,resource_url,resource_type,is_external');
+        console.log('domain,resource_url,resource_type,is_external,screenshot_path');
         handleStdoutOutput.headerPrinted = true;
       }
       
       // Print each resource as a CSV row
       if (resources && resources.length > 0) {
         resources.forEach(res => {
-          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'}`);
+          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'},"${result.screenshotPath || ''}"`);
         });
       } else {
-        console.log(`"${domain}","no resources found","none",0`);
+        console.log(`"${domain}","no resources found","none",0,"${result.screenshotPath || ''}"`);
       }
       break;
       
@@ -354,6 +405,9 @@ function handleStdoutOutput(result, format = 'json') {
       console.log(`Domain: ${domain}`);
       console.log(`Final URL: ${finalUrl}`);
       console.log(`Resources: ${resources ? resources.length : 0}`);
+      if (result.screenshotPath) {
+        console.log(`Screenshot: ${result.screenshotPath}`);
+      }
       
       if (resources && resources.length > 0) {
         console.log('\nResource List:');
@@ -387,6 +441,17 @@ async function main() {
   const useStdout = !!opts.stdout;
   const outputFormat = opts.outputFormat || 'json';
   
+  // Screenshot options
+  const takeScreenshot = !!opts.screenshot;
+  const screenshotFormat = (opts.screenshotFormat || 'png').toLowerCase();
+  const screenshotPath = opts.screenshotPath || './screenshots';
+  const fullPageScreenshot = !!opts.screenshotFullPage;
+  
+  // Ensure screenshot directory exists if needed
+  if (takeScreenshot) {
+    ensureScreenshotDirectory(screenshotPath);
+  }
+  
   // Log configuration
   logger.info({
     msg: 'Starting scan with configuration',
@@ -398,7 +463,13 @@ async function main() {
     poolSize,
     maxRetries,
     useStdout,
-    outputFormat
+    outputFormat,
+    ...(takeScreenshot && {
+      takeScreenshot,
+      screenshotFormat,
+      screenshotPath,
+      fullPageScreenshot
+    })
   });
 
   // Initialize DB only if not using stdout
@@ -427,7 +498,15 @@ async function main() {
 
     // We'll do the scanning in the scanQueue
     scanQueue.add(async () => {
-      const scanOptions = { captureAll, captureTypes, externalOnly };
+      const scanOptions = { 
+        captureAll, 
+        captureTypes, 
+        externalOnly,
+        takeScreenshot,
+        screenshotFormat,
+        screenshotPath,
+        fullPageScreenshot
+      };
       const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
       
       if (useStdout) {
@@ -482,7 +561,15 @@ async function main() {
 
     // Add a scanning job to scanQueue
     scanQueue.add(async () => {
-      const scanOptions = { captureAll, captureTypes, externalOnly };
+      const scanOptions = { 
+        captureAll, 
+        captureTypes, 
+        externalOnly,
+        takeScreenshot,
+        screenshotFormat,
+        screenshotPath,
+        fullPageScreenshot
+      };
       const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
       
       if (useStdout) {

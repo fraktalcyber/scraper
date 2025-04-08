@@ -163,6 +163,10 @@ Options:
   --block-types <types>        Comma-separated list of resource types to block (default: "image,font,media")
   --stdout                     Output results to stdout instead of the database
   --output-format <format>     Format for stdout output: json, csv, or text (default: "json")
+  --screenshot                 Take screenshots of visited pages
+  --screenshot-format <format> Screenshot format: png or jpeg (default: "png")
+  --screenshot-path <path>     Directory to save screenshots (default: "./screenshots")
+  --screenshot-full-page       Capture full page screenshots, not just viewport
   -h, --help                   Display help information
 ```
 
@@ -199,6 +203,20 @@ node scan-domains-playwright.js --domain example.com --stdout > results.json
 
 # Process multiple domains and output as CSV
 node scan-domains-playwright.js --input domains.txt --stdout --output-format csv > results.csv
+
+# Screenshot Examples
+
+# Take screenshots while scanning
+node scan-domains-playwright.js --domain example.com --screenshot
+
+# Take full page screenshots in JPEG format
+node scan-domains-playwright.js --domain example.com --screenshot --screenshot-format jpeg --screenshot-full-page
+
+# Customize screenshot directory
+node scan-domains-playwright.js --domain example.com --screenshot --screenshot-path ./images
+
+# Combine with stdout output
+node scan-domains-playwright.js --domain example.com --stdout --screenshot
 ```
 
 ## Architecture
@@ -219,6 +237,7 @@ The SQLite database contains two tables:
 - `finalUrl`: TEXT (the URL after any redirects)
 - `success`: INTEGER (1=success, 0=failure)
 - `error`: TEXT (error message if scan failed)
+- `screenshotPath`: TEXT (path to the screenshot file if taken)
 - `scannedAt`: DATETIME (timestamp of scan)
 
 ### `resources`

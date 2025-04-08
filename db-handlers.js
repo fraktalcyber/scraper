@@ -36,18 +36,19 @@ function dbGet(db, sql, params = []) {
 /**
  * Upsert a scan record and return its ID.
  */
-async function upsertScan(db, { domain, finalUrl, success, error }) {
+async function upsertScan(db, { domain, finalUrl, success, error, screenshotPath }) {
   // Do the upsert
   await dbRun(
     db,
-    `INSERT INTO scans (domain, finalUrl, success, error)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO scans (domain, finalUrl, success, error, screenshotPath)
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(domain) DO UPDATE
        SET finalUrl = excluded.finalUrl,
            success = excluded.success,
            error = excluded.error,
+           screenshotPath = excluded.screenshotPath,
            scannedAt = CURRENT_TIMESTAMP`,
-    [domain, finalUrl || null, success ? 1 : 0, error || null]
+    [domain, finalUrl || null, success ? 1 : 0, error || null, screenshotPath || null]
   );
 
   // Get the scan ID
@@ -89,7 +90,7 @@ function createDbHandlers(customLogger = defaultLogger) {
      * Main DB write handler
      */
     async handleDbWrite(db, result, processedDomains, writeCheckpoint) {
-      const { domain, success, error, finalUrl, resources } = result;
+      const { domain, success, error, finalUrl, screenshotPath, resources } = result;
 
       try {
         // Start transaction
@@ -102,6 +103,7 @@ function createDbHandlers(customLogger = defaultLogger) {
             finalUrl: finalUrl || null,
             success,
             error,
+            screenshotPath,
           });
 
           // Handle resources
