@@ -60,22 +60,22 @@ async function upsertScan(db, { domain, finalUrl, success, error }) {
 }
 
 /**
- * Replace external scripts for a scan.
+ * Replace resources for a scan.
  */
-async function replaceExternalScripts(db, scanId, scriptUrls) {
-  // First delete existing scripts
-  await dbRun(db, 'DELETE FROM externalScripts WHERE scanId = ?', [scanId]);
+async function replaceResources(db, scanId, resources) {
+  // First delete existing resources
+  await dbRun(db, 'DELETE FROM resources WHERE scanId = ?', [scanId]);
   
-  // If no new scripts, we're done
-  if (!scriptUrls || scriptUrls.length === 0) return;
+  // If no new resources, we're done
+  if (!resources || resources.length === 0) return;
   
-  // Insert new scripts
-  const placeholders = scriptUrls.map(() => '(?, ?)').join(',');
-  const values = scriptUrls.flatMap(url => [scanId, url]);
+  // Insert new resources
+  const placeholders = resources.map(() => '(?, ?, ?, ?)').join(',');
+  const values = resources.flatMap(r => [scanId, r.url, r.type, r.isExternal ? 1 : 0]);
   
   await dbRun(
     db,
-    `INSERT INTO externalScripts (scanId, scriptUrl) VALUES ${placeholders}`,
+    `INSERT INTO resources (scanId, url, resourceType, isExternal) VALUES ${placeholders}`,
     values
   );
 }
@@ -89,7 +89,7 @@ function createDbHandlers(customLogger = defaultLogger) {
      * Main DB write handler
      */
     async handleDbWrite(db, result, processedDomains, writeCheckpoint) {
-      const { domain, success, error, finalUrl, externalScripts } = result;
+      const { domain, success, error, finalUrl, resources } = result;
 
       try {
         // Start transaction
@@ -104,11 +104,11 @@ function createDbHandlers(customLogger = defaultLogger) {
             error,
           });
 
-          // Handle scripts
+          // Handle resources
           if (success) {
-            await replaceExternalScripts(db, scanId, externalScripts || []);
+            await replaceResources(db, scanId, resources || []);
           } else {
-            await dbRun(db, 'DELETE FROM externalScripts WHERE scanId = ?', [scanId]);
+            await dbRun(db, 'DELETE FROM resources WHERE scanId = ?', [scanId]);
           }
 
           // Commit transaction

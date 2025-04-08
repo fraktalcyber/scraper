@@ -1,16 +1,20 @@
 import { chromium } from 'playwright';
 
 class BrowserPool {
-  constructor(poolSize) {
+  constructor(poolSize, logger = console, options = {}) {
     this.poolSize = poolSize;
     this.browser = null;
     this.contexts = [];
     this.contextQueue = [];
     this.contextUsage = new Map();
     this.maxUsagePerContext = 50;
+    this.logger = logger;
+    this.options = options;
   }
 
   async init() {
+    const blockTypes = this.options.blockTypes || ['image', 'font', 'media'];
+    this.logger.info(`Browser pool initializing with block types: ${blockTypes.join(', ')}`);
     this.browser = await chromium.launch({
       headless: true,
       args: [
@@ -44,11 +48,11 @@ class BrowserPool {
     });
 
     for (let i = 0; i < this.poolSize; i++) {
-      await this.createFreshContext();
+      await this.createFreshContext(this.options.blockTypes);
     }
   }
 
-  async createFreshContext() {
+  async createFreshContext(blockTypes = ['image', 'font', 'media']) {
     const context = await this.browser.newContext({
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -56,14 +60,17 @@ class BrowserPool {
       ignoreHTTPSErrors: true
     });
 
-    await context.route('**/*', (route) => {
-      const rType = route.request().resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(rType)) {
-        route.abort();
-      } else {
-        route.continue();
-      }
-    });
+    // Only block specified resource types
+    if (blockTypes && blockTypes.length > 0) {
+      await context.route('**/*', (route) => {
+        const rType = route.request().resourceType();
+        if (blockTypes.includes(rType)) {
+          route.abort();
+        } else {
+          route.continue();
+        }
+      });
+    }
 
     this.contextUsage.set(context, 0);
     this.contexts.push(context);
@@ -83,7 +90,7 @@ class BrowserPool {
           const usageCount = this.contextUsage.get(context) || 0;
           if (usageCount >= this.maxUsagePerContext) {
             await context.close();
-            context = await this.createFreshContext();
+            context = await this.createFreshContext(this.options.blockTypes);
           }
           
           await context.pages();
@@ -99,7 +106,7 @@ class BrowserPool {
         if (context) {
           await context.close().catch(() => {});
         }
-        context = await this.createFreshContext();
+        context = await this.createFreshContext(this.options.blockTypes);
         if (attempts >= MAX_ATTEMPTS) throw err;
       }
     }
@@ -121,7 +128,7 @@ class BrowserPool {
       }
     } catch (err) {
       await context.close().catch(() => {});
-      const newContext = await this.createFreshContext();
+      const newContext = await this.createFreshContext(this.options.blockTypes);
       this.contexts.push(newContext);
     }
   }

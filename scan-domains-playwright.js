@@ -26,6 +26,9 @@ import {
 	createDbHandlers
 } from './db-handlers.js';
 
+// Supported resource types
+const RESOURCE_TYPES = ['script', 'stylesheet', 'fetch', 'xhr', 'image', 'font', 'media', 'websocket', 'manifest', 'other'];
+
 import BrowserPool from './browser-pool.js';
 
 /*
@@ -52,6 +55,10 @@ program
   .option('--concurrency <number>', 'Number of concurrent scanning tasks', '5')
   .option('--pool-size <number>', 'Number of browser contexts to reuse', '5')
   .option('--max-retries <number>', 'Number of retries for a failing domain', '3')
+  .option('--capture-types <types>', 'Comma-separated list of resource types to capture (script,stylesheet,fetch,xhr,image,font,media,websocket,manifest,other)', 'script')
+  .option('--capture-all', 'Capture all resource types')
+  .option('--external-only', 'Only capture resources from external domains', true)
+  .option('--block-types <types>', 'Comma-separated list of resource types to block (image,font,stylesheet,media)', 'image,font,media')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -112,13 +119,27 @@ function initDb(dbPath) {
       )
     `);
     db.run(`
-      CREATE TABLE IF NOT EXISTS externalScripts (
+      CREATE TABLE IF NOT EXISTS resources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scanId INTEGER NOT NULL,
-        scriptUrl TEXT NOT NULL,
+        url TEXT NOT NULL,
+        resourceType TEXT NOT NULL,
+        isExternal INTEGER NOT NULL DEFAULT 1,
         FOREIGN KEY(scanId) REFERENCES scans(id)
       )
     `);
+    
+    // Handle migration from old schema if needed
+    db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='externalScripts'", (err, row) => {
+      if (row) {
+        // The old table exists, migrate data
+        logger.info('Migrating data from externalScripts to resources table...');
+        db.run(`
+          INSERT OR IGNORE INTO resources (scanId, url, resourceType, isExternal)
+          SELECT scanId, scriptUrl, 'script', 1 FROM externalScripts
+        `);
+      }
+    });
   });
   logger.info(`SQLite DB initialized at: ${dbPath}`);
   return db;
@@ -163,12 +184,12 @@ function writeCheckpoint(processedSet) {
 // Scan Logic (No DB writes here!)
 ////////////////////////////////////////////////////////////////////////////////
 
-async function scanDomain(domain, browserPool, maxRetries = 3) {
+async function scanDomain(domain, browserPool, maxRetries = 3, options = {}) {
   let attempt = 0;
   while (attempt < maxRetries) {
     attempt++;
     try {
-      return await doPlaywrightScan(domain, browserPool);
+      return await doPlaywrightScan(domain, browserPool, options);
     } catch (err) {
       logger.warn({
         msg: 'Scan failed, will retry if attempts remain',
@@ -182,7 +203,7 @@ async function scanDomain(domain, browserPool, maxRetries = 3) {
           success: false,
           error: err.message,
           finalUrl: null,
-          externalScripts: [],
+          resources: [],
         };
       }
     }
@@ -190,36 +211,47 @@ async function scanDomain(domain, browserPool, maxRetries = 3) {
 }
 
 /**
- * Actually load the page, gather external JS scripts.
+ * Actually load the page and gather resources.
  */
-async function doPlaywrightScan(domain, browserPool) {
+async function doPlaywrightScan(domain, browserPool, options = {}) {
   let raw = domain.trim();
-  /*
   if (!/^https?:\/\//i.test(raw)) {
     raw = 'https://' + raw;
   }
-  */
 
   const urlObj = new URL(raw);
-  /*
-  if (!urlObj.hostname.startsWith('www.')) {
-    urlObj.hostname = 'www.' + urlObj.hostname;
-  }
-  */
   const finalUrlToVisit = urlObj.toString();
 
   const context = await browserPool.acquireContext();
   const page = await context.newPage();
 
-  const scriptUrls = new Set();
+  // Parse capture types
+  const captureAll = options.captureAll || false;
+  const captureTypes = captureAll 
+    ? RESOURCE_TYPES 
+    : (options.captureTypes || 'script').split(',').map(t => t.trim());
+  const externalOnly = options.externalOnly !== false;
+
+  logger.info({
+    msg: 'Scan configuration', 
+    captureTypes, 
+    externalOnly, 
+    domain
+  });
+
+  // Store all requested resources by type
+  const resourcesByType = new Map();
+  captureTypes.forEach(type => resourcesByType.set(type, new Set()));
+
+  // Track all requests
   page.on('requestfinished', (req) => {
-    if (req.resourceType() === 'script') {
-      scriptUrls.add(req.url());
+    const type = req.resourceType();
+    if (captureTypes.includes(type)) {
+      const set = resourcesByType.get(type);
+      if (set) set.add(req.url());
     }
   });
 
-  // some tradeoffs here because we did a massive crawl, consider using networktimeout 
-  // or something for more comprehensive results
   try {
     await page.goto(finalUrlToVisit, {
       timeout: 10000,
@@ -228,22 +260,40 @@ async function doPlaywrightScan(domain, browserPool) {
     const finalPageUrl = page.url();
     const finalHostname = new URL(finalPageUrl).hostname.toLowerCase();
 
-    // only collecting scripts here, modify if you want something else 
-    const domScripts = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('script[src]')).map((el) => el.src)
-    );
-    domScripts.forEach((src) => scriptUrls.add(src));
+    // Collect additional DOM resources if needed
+    if (captureTypes.includes('script')) {
+      const domScripts = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('script[src]')).map((el) => el.src)
+      );
+      domScripts.forEach(src => resourcesByType.get('script').add(src));
+    }
+
+    if (captureTypes.includes('stylesheet')) {
+      const cssLinks = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((el) => el.href)
+      );
+      cssLinks.forEach(href => resourcesByType.get('stylesheet').add(href));
+    }
     
-    // only store urls that point to external domains
-    const externalScripts = [];
-    for (const sUrl of scriptUrls) {
-      try {
-        const sHost = new URL(sUrl).hostname.toLowerCase();
-        if (sHost !== finalHostname) {
-          externalScripts.push(sUrl);
+    // Process resources
+    const resources = [];
+    for (const [type, urls] of resourcesByType.entries()) {
+      for (const url of urls) {
+        try {
+          const resourceHost = new URL(url).hostname.toLowerCase();
+          const isExternal = resourceHost !== finalHostname;
+          
+          // Only add if external flag matches setting
+          if (!externalOnly || isExternal) {
+            resources.push({
+              url,
+              type,
+              isExternal
+            });
+          }
+        } catch (_) {
+          // ignore parse errors
         }
-      } catch (_) {
-        // ignore parse errors
       }
     }
 
@@ -255,7 +305,7 @@ async function doPlaywrightScan(domain, browserPool) {
       success: true,
       error: null,
       finalUrl: finalPageUrl,
-      externalScripts,
+      resources,
     };
   } catch (err) {
     await page.close().catch(() => {});
@@ -272,6 +322,24 @@ async function main() {
   const concurrency = parseInt(opts.concurrency, 10) || 5;
   const poolSize = parseInt(opts.poolSize, 10) || concurrency;
   const maxRetries = parseInt(opts.maxRetries, 10) || 3;
+
+  // Parse resource type options
+  const captureAll = !!opts.captureAll;
+  const captureTypes = opts.captureTypes || 'script';
+  const externalOnly = opts.externalOnly !== 'false';
+  const blockTypes = opts.blockTypes ? opts.blockTypes.split(',').map(t => t.trim()) : ['image', 'font', 'media'];
+  
+  // Log configuration
+  logger.info({
+    msg: 'Starting scan with configuration',
+    captureAll,
+    captureTypes,
+    externalOnly,
+    blockTypes,
+    concurrency,
+    poolSize,
+    maxRetries
+  });
 
   const db = initDb(opts.db);
   const processedDomains = loadCheckpoint();
@@ -293,12 +361,13 @@ async function main() {
       return;
     }
     logger.info(`Scanning single domain: ${opts.domain}`);
-    const browserPool = new BrowserPool(poolSize, logger);
+    const browserPool = new BrowserPool(poolSize, logger, { blockTypes });
     await browserPool.init();
 
     // We'll do the scanning in the scanQueue
     scanQueue.add(async () => {
-      const result = await scanDomain(opts.domain, browserPool, maxRetries);
+      const scanOptions = { captureAll, captureTypes, externalOnly };
+      const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
       // Now queue the DB update
       await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
     });
@@ -324,7 +393,7 @@ async function main() {
     process.exit(1);
   }
 
-  const browserPool = new BrowserPool(poolSize, logger);
+  const browserPool = new BrowserPool(poolSize, logger, { blockTypes });
   await browserPool.init();
 
   let totalCount = 0;
@@ -345,7 +414,8 @@ async function main() {
 
     // Add a scanning job to scanQueue
     scanQueue.add(async () => {
-      const result = await scanDomain(domain, browserPool, maxRetries);
+      const scanOptions = { captureAll, captureTypes, externalOnly };
+      const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
       // Then enqueue a DB job
       await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
     });
