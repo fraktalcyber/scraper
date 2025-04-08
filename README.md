@@ -160,7 +160,7 @@ Options:
                                Available types: script,stylesheet,fetch,xhr,image,font,media,websocket,manifest,other
   --capture-all                Capture all resource types
   --external-only <boolean>    Only capture resources from external domains (default: true)
-  --block-types <types>        Comma-separated list of resource types to block (default: "image,font,media")
+  --block-types <types>        Comma-separated list of resource types to block, use "none" to allow all (default: "image,font,media")
   --stdout                     Output results to stdout instead of the database
   --output-format <format>     Format for stdout output: json, csv, or text (default: "json")
   --screenshot                 Take screenshots of visited pages
@@ -224,6 +224,9 @@ node scan-domains-playwright.js --domain example.com --screenshot --wait-until n
 
 # Full capture with all options
 node scan-domains-playwright.js --domain example.com --screenshot --screenshot-full-page --wait-until networkidle --capture-all
+
+# Allow all resource types (no blocking)
+node scan-domains-playwright.js --domain example.com --block-types none
 ```
 
 ## Architecture

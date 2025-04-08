@@ -58,7 +58,7 @@ program
   .option('--capture-types <types>', 'Comma-separated list of resource types to capture (script,stylesheet,fetch,xhr,image,font,media,websocket,manifest,other)', 'script')
   .option('--capture-all', 'Capture all resource types')
   .option('--external-only', 'Only capture resources from external domains', true)
-  .option('--block-types <types>', 'Comma-separated list of resource types to block (image,font,stylesheet,media)', 'image,font,media')
+  .option('--block-types <types>', 'Comma-separated list of resource types to block (image,font,stylesheet,media), use "none" to allow all types', 'image,font,media')
   .option('--stdout', 'Output results to stdout instead of the database')
   .option('--output-format <format>', 'Format for stdout output: json, csv, or text', 'json')
   .option('--screenshot', 'Take screenshots of visited pages')
@@ -442,7 +442,10 @@ async function main() {
   const captureAll = !!opts.captureAll;
   const captureTypes = opts.captureTypes || 'script';
   const externalOnly = opts.externalOnly !== 'false';
-  const blockTypes = opts.blockTypes ? opts.blockTypes.split(',').map(t => t.trim()) : ['image', 'font', 'media'];
+  // Process block types, with special handling for "none"
+  const blockTypes = !opts.blockTypes || opts.blockTypes === 'none' 
+    ? [] 
+    : opts.blockTypes.split(',').map(t => t.trim());
   const useStdout = !!opts.stdout;
   const outputFormat = opts.outputFormat || 'json';
   
