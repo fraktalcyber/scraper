@@ -167,6 +167,7 @@ Options:
   --screenshot-format <format> Screenshot format: png or jpeg (default: "png")
   --screenshot-path <path>     Directory to save screenshots (default: "./screenshots")
   --screenshot-full-page       Capture full page screenshots, not just viewport
+  --wait-until <state>         When to consider navigation complete: domcontentloaded, load, networkidle (default: "domcontentloaded")
   -h, --help                   Display help information
 ```
 
@@ -217,6 +218,12 @@ node scan-domains-playwright.js --domain example.com --screenshot --screenshot-p
 
 # Combine with stdout output
 node scan-domains-playwright.js --domain example.com --stdout --screenshot
+
+# Wait for all network activity to finish before capturing
+node scan-domains-playwright.js --domain example.com --screenshot --wait-until networkidle
+
+# Full capture with all options
+node scan-domains-playwright.js --domain example.com --screenshot --screenshot-full-page --wait-until networkidle --capture-all
 ```
 
 ## Architecture

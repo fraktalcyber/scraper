@@ -65,6 +65,7 @@ program
   .option('--screenshot-format <format>', 'Screenshot format: png or jpeg', 'png')
   .option('--screenshot-path <path>', 'Directory to save screenshots', './screenshots')
   .option('--screenshot-full-page', 'Capture full page screenshots, not just viewport')
+  .option('--wait-until <state>', 'When to consider navigation complete: domcontentloaded, load, networkidle', 'domcontentloaded')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -245,6 +246,9 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
   const screenshotFormat = options.screenshotFormat || 'png';
   const screenshotPath = options.screenshotPath || './screenshots';
   const fullPageScreenshot = options.fullPageScreenshot || false;
+  
+  // Parse navigation options
+  const waitUntil = options.waitUntil || 'domcontentloaded';
 
   const context = await browserPool.acquireContext();
   const page = await context.newPage();
@@ -277,9 +281,10 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
   });
 
   try {
+    logger.info(`Navigating to ${finalUrlToVisit} with waitUntil: ${waitUntil}`);
     await page.goto(finalUrlToVisit, {
-      timeout: 10000,
-      waitUntil: 'domcontentloaded',
+      timeout: 30000, // Increased timeout for networkidle
+      waitUntil: waitUntil,
     });
     const finalPageUrl = page.url();
     const finalHostname = new URL(finalPageUrl).hostname.toLowerCase();
@@ -447,6 +452,9 @@ async function main() {
   const screenshotPath = opts.screenshotPath || './screenshots';
   const fullPageScreenshot = !!opts.screenshotFullPage;
   
+  // Navigation options
+  const waitUntil = opts.waitUntil || 'domcontentloaded';
+  
   // Ensure screenshot directory exists if needed
   if (takeScreenshot) {
     ensureScreenshotDirectory(screenshotPath);
@@ -469,7 +477,8 @@ async function main() {
       screenshotFormat,
       screenshotPath,
       fullPageScreenshot
-    })
+    }),
+    waitUntil
   });
 
   // Initialize DB only if not using stdout
@@ -505,7 +514,8 @@ async function main() {
         takeScreenshot,
         screenshotFormat,
         screenshotPath,
-        fullPageScreenshot
+        fullPageScreenshot,
+        waitUntil
       };
       const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
       
@@ -568,7 +578,8 @@ async function main() {
         takeScreenshot,
         screenshotFormat,
         screenshotPath,
-        fullPageScreenshot
+        fullPageScreenshot,
+        waitUntil
       };
       const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
       
