@@ -66,6 +66,7 @@ program
   .option('--screenshot-path <path>', 'Directory to save screenshots', './screenshots')
   .option('--screenshot-full-page', 'Capture full page screenshots, not just viewport')
   .option('--wait-until <state>', 'When to consider navigation complete: domcontentloaded, load, networkidle', 'domcontentloaded')
+  .option('--check-sri', 'Check for Subresource Integrity (SRI) attributes on scripts and stylesheets')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -143,6 +144,7 @@ function initDb(dbPath) {
         url TEXT NOT NULL,
         resourceType TEXT NOT NULL,
         isExternal INTEGER NOT NULL DEFAULT 1,
+        hasSri INTEGER,
         FOREIGN KEY(scanId) REFERENCES scans(id)
       )
     `);
@@ -223,10 +225,59 @@ async function scanDomain(domain, browserPool, maxRetries = 3, options = {}) {
           finalUrl: null,
           screenshotPath: null,
           resources: [],
+          ...(options.checkSri && {
+            sri: {
+              checked: true,
+              resourcesWithoutSri: { scripts: [], stylesheets: [] }
+            }
+          })
         };
       }
     }
   }
+}
+
+/**
+ * Checks if resources have SRI (Subresource Integrity) attributes
+ */
+async function checkSriAttributes(page) {
+  // Get scripts and stylesheets without integrity attributes
+  const resourcesWithoutSri = await page.evaluate(() => {
+    const results = {
+      scripts: [],
+      stylesheets: []
+    };
+    
+    // Check scripts
+    document.querySelectorAll('script[src]').forEach(script => {
+      const src = script.getAttribute('src');
+      const integrity = script.getAttribute('integrity');
+      if (!integrity && src) {
+        results.scripts.push({
+          src,
+          element: 'script',
+          hasIntegrity: false
+        });
+      }
+    });
+    
+    // Check stylesheets
+    document.querySelectorAll('link[rel="stylesheet"][href]').forEach(link => {
+      const href = link.getAttribute('href');
+      const integrity = link.getAttribute('integrity');
+      if (!integrity && href) {
+        results.stylesheets.push({
+          src: href,
+          element: 'stylesheet',
+          hasIntegrity: false
+        });
+      }
+    });
+    
+    return results;
+  });
+  
+  return resourcesWithoutSri;
 }
 
 /**
@@ -249,6 +300,9 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
   
   // Parse navigation options
   const waitUntil = options.waitUntil || 'domcontentloaded';
+  
+  // Parse security check options
+  const checkSri = options.checkSri || false;
 
   const context = await browserPool.acquireContext();
   const page = await context.newPage();
@@ -288,6 +342,18 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
     });
     const finalPageUrl = page.url();
     const finalHostname = new URL(finalPageUrl).hostname.toLowerCase();
+    
+    // Check for SRI attributes if enabled
+    let resourcesWithoutSri = null;
+    if (checkSri) {
+      resourcesWithoutSri = await checkSriAttributes(page);
+      logger.info({
+        msg: 'SRI check results',
+        domain,
+        scriptsWithoutSri: resourcesWithoutSri.scripts.length,
+        stylesheetsWithoutSri: resourcesWithoutSri.stylesheets.length
+      });
+    }
     
     // Take screenshot if enabled
     let screenshotFilePath = null;
@@ -364,6 +430,12 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
       finalUrl: finalPageUrl,
       screenshotPath: screenshotFilePath,
       resources,
+      ...(resourcesWithoutSri && { 
+        sri: {
+          checked: true,
+          resourcesWithoutSri
+        }
+      })
     };
   } catch (err) {
     await page.close().catch(() => {});
@@ -391,17 +463,48 @@ function handleStdoutOutput(result, format = 'json') {
     case 'csv':
       // Print CSV header if this is the first result
       if (!handleStdoutOutput.headerPrinted) {
-        console.log('domain,resource_url,resource_type,is_external,screenshot_path');
+        console.log('domain,resource_url,resource_type,is_external,screenshot_path,has_sri');
         handleStdoutOutput.headerPrinted = true;
       }
       
       // Print each resource as a CSV row
       if (resources && resources.length > 0) {
         resources.forEach(res => {
-          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'},"${result.screenshotPath || ''}"`);
+          // Check if this resource is in the SRI list
+          let hasSri = "N/A";
+          if (result.sri) {
+            const isScript = res.type === 'script';
+            const sriList = isScript ? result.sri.resourcesWithoutSri.scripts : result.sri.resourcesWithoutSri.stylesheets;
+            const foundInSriList = sriList.some(item => item.src === res.url);
+            
+            // Only mark as missing SRI if it's a script or stylesheet
+            if ((isScript || res.type === 'stylesheet') && foundInSriList) {
+              hasSri = "0"; // No SRI
+            } else if (isScript || res.type === 'stylesheet') {
+              hasSri = "1"; // Has SRI
+            }
+          }
+          
+          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'},"${result.screenshotPath || ''}","${hasSri}"`);
         });
+        
+        // Also add SRI-missing resources that might not be in the regular resources list
+        if (result.sri) {
+          const allSriMissing = [
+            ...result.sri.resourcesWithoutSri.scripts,
+            ...result.sri.resourcesWithoutSri.stylesheets
+          ];
+          
+          // Filter for resources that weren't already reported
+          const reportedUrls = new Set(resources.map(r => r.url));
+          const missingOnlySri = allSriMissing.filter(item => !reportedUrls.has(item.src));
+          
+          missingOnlySri.forEach(item => {
+            console.log(`"${domain}","${item.src}","${item.element}",1,"${result.screenshotPath || ''}","0"`);
+          });
+        }
       } else {
-        console.log(`"${domain}","no resources found","none",0,"${result.screenshotPath || ''}"`);
+        console.log(`"${domain}","no resources found","none",0,"${result.screenshotPath || ''}","N/A"`);
       }
       break;
       
@@ -412,6 +515,28 @@ function handleStdoutOutput(result, format = 'json') {
       console.log(`Resources: ${resources ? resources.length : 0}`);
       if (result.screenshotPath) {
         console.log(`Screenshot: ${result.screenshotPath}`);
+      }
+      
+      // Print SRI information if available
+      if (result.sri) {
+        const scriptCount = result.sri.resourcesWithoutSri.scripts.length;
+        const stylesheetCount = result.sri.resourcesWithoutSri.stylesheets.length;
+        const totalMissing = scriptCount + stylesheetCount;
+        
+        console.log(`\nSubresource Integrity (SRI) Check:`);
+        console.log(`- Resources missing integrity attribute: ${totalMissing}`);
+        console.log(`  - Scripts: ${scriptCount}`);
+        console.log(`  - Stylesheets: ${stylesheetCount}`);
+        
+        if (totalMissing > 0) {
+          console.log(`\nResources without SRI:`);
+          result.sri.resourcesWithoutSri.scripts.forEach(script => {
+            console.log(`  - [script] ${script.src}`);
+          });
+          result.sri.resourcesWithoutSri.stylesheets.forEach(stylesheet => {
+            console.log(`  - [stylesheet] ${stylesheet.src}`);
+          });
+        }
       }
       
       if (resources && resources.length > 0) {
@@ -458,6 +583,9 @@ async function main() {
   // Navigation options
   const waitUntil = opts.waitUntil || 'domcontentloaded';
   
+  // Security check options
+  const checkSri = !!opts.checkSri;
+  
   // Ensure screenshot directory exists if needed
   if (takeScreenshot) {
     ensureScreenshotDirectory(screenshotPath);
@@ -481,7 +609,8 @@ async function main() {
       screenshotPath,
       fullPageScreenshot
     }),
-    waitUntil
+    waitUntil,
+    checkSri
   });
 
   // Initialize DB only if not using stdout
@@ -518,7 +647,8 @@ async function main() {
         screenshotFormat,
         screenshotPath,
         fullPageScreenshot,
-        waitUntil
+        waitUntil,
+        checkSri
       };
       const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
       
@@ -582,7 +712,8 @@ async function main() {
         screenshotFormat,
         screenshotPath,
         fullPageScreenshot,
-        waitUntil
+        waitUntil,
+        checkSri
       };
       const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
       

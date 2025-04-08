@@ -71,12 +71,18 @@ async function replaceResources(db, scanId, resources) {
   if (!resources || resources.length === 0) return;
   
   // Insert new resources
-  const placeholders = resources.map(() => '(?, ?, ?, ?)').join(',');
-  const values = resources.flatMap(r => [scanId, r.url, r.type, r.isExternal ? 1 : 0]);
+  const placeholders = resources.map(() => '(?, ?, ?, ?, ?)').join(',');
+  const values = resources.flatMap(r => [
+    scanId, 
+    r.url, 
+    r.type, 
+    r.isExternal ? 1 : 0,
+    r.hasSri !== undefined ? r.hasSri : null
+  ]);
   
   await dbRun(
     db,
-    `INSERT INTO resources (scanId, url, resourceType, isExternal) VALUES ${placeholders}`,
+    `INSERT INTO resources (scanId, url, resourceType, isExternal, hasSri) VALUES ${placeholders}`,
     values
   );
 }
@@ -90,7 +96,7 @@ function createDbHandlers(customLogger = defaultLogger) {
      * Main DB write handler
      */
     async handleDbWrite(db, result, processedDomains, writeCheckpoint) {
-      const { domain, success, error, finalUrl, screenshotPath, resources } = result;
+      const { domain, success, error, finalUrl, screenshotPath, resources, sri } = result;
 
       try {
         // Start transaction
@@ -108,7 +114,58 @@ function createDbHandlers(customLogger = defaultLogger) {
 
           // Handle resources
           if (success) {
-            await replaceResources(db, scanId, resources || []);
+            // If SRI check was performed, mark resources accordingly
+            let resourcesToSave = resources || [];
+            
+            if (sri && sri.checked) {
+              // Create sets of URLs without SRI
+              const scriptsWithoutSri = new Set(sri.resourcesWithoutSri.scripts.map(s => s.src));
+              const stylesheetsWithoutSri = new Set(sri.resourcesWithoutSri.stylesheets.map(s => s.src));
+              
+              // Add hasSri field to resources
+              resourcesToSave = resourcesToSave.map(resource => {
+                const isScriptOrStylesheet = resource.type === 'script' || resource.type === 'stylesheet';
+                if (isScriptOrStylesheet) {
+                  const inScriptList = scriptsWithoutSri.has(resource.url);
+                  const inStylesheetList = stylesheetsWithoutSri.has(resource.url);
+                  
+                  return {
+                    ...resource,
+                    hasSri: (inScriptList || inStylesheetList) ? 0 : 1
+                  };
+                }
+                return resource;
+              });
+              
+              // Add resources that were found in SRI check but not in main resource list
+              const allCapturedUrls = new Set(resources.map(r => r.url));
+              
+              // Add missing script resources
+              sri.resourcesWithoutSri.scripts.forEach(script => {
+                if (!allCapturedUrls.has(script.src)) {
+                  resourcesToSave.push({
+                    url: script.src,
+                    type: 'script',
+                    isExternal: true, // Assuming external since these are missing SRI
+                    hasSri: 0
+                  });
+                }
+              });
+              
+              // Add missing stylesheet resources
+              sri.resourcesWithoutSri.stylesheets.forEach(stylesheet => {
+                if (!allCapturedUrls.has(stylesheet.src)) {
+                  resourcesToSave.push({
+                    url: stylesheet.src,
+                    type: 'stylesheet',
+                    isExternal: true, // Assuming external since these are missing SRI
+                    hasSri: 0
+                  });
+                }
+              });
+            }
+            
+            await replaceResources(db, scanId, resourcesToSave);
           } else {
             await dbRun(db, 'DELETE FROM resources WHERE scanId = ?', [scanId]);
           }

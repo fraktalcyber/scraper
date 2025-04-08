@@ -168,6 +168,7 @@ Options:
   --screenshot-path <path>     Directory to save screenshots (default: "./screenshots")
   --screenshot-full-page       Capture full page screenshots, not just viewport
   --wait-until <state>         When to consider navigation complete: domcontentloaded, load, networkidle (default: "domcontentloaded")
+  --check-sri                  Check for Subresource Integrity (SRI) attributes on scripts and stylesheets
   -h, --help                   Display help information
 ```
 
@@ -227,6 +228,17 @@ node scan-domains-playwright.js --domain example.com --screenshot --screenshot-f
 
 # Allow all resource types (no blocking)
 node scan-domains-playwright.js --domain example.com --block-types none
+
+# Security Checks
+
+# Check for missing Subresource Integrity (SRI) attributes
+node scan-domains-playwright.js --domain example.com --check-sri
+
+# Combine SRI check with other features
+node scan-domains-playwright.js --domain example.com --check-sri --stdout --output-format text
+
+# Full security scan with network idle wait and SRI checking
+node scan-domains-playwright.js --domain example.com --wait-until networkidle --check-sri
 ```
 
 ## Architecture
@@ -256,6 +268,7 @@ The SQLite database contains two tables:
 - `url`: TEXT (URL of the resource)
 - `resourceType`: TEXT (type of resource: script, stylesheet, image, etc.)
 - `isExternal`: INTEGER (1=external domain, 0=same domain)
+- `hasSri`: INTEGER (1=has integrity attribute, 0=missing integrity attribute, NULL=not applicable)
 
 ## Troubleshooting
 
