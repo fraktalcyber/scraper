@@ -59,6 +59,8 @@ program
   .option('--capture-all', 'Capture all resource types')
   .option('--external-only', 'Only capture resources from external domains', true)
   .option('--block-types <types>', 'Comma-separated list of resource types to block (image,font,stylesheet,media)', 'image,font,media')
+  .option('--stdout', 'Output results to stdout instead of the database')
+  .option('--output-format <format>', 'Format for stdout output: json, csv, or text', 'json')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -314,6 +316,60 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
   }
 }
 
+/**
+ * Process result and output to stdout in the specified format
+ */
+function handleStdoutOutput(result, format = 'json') {
+  const { domain, success, error, finalUrl, resources } = result;
+  
+  if (!success) {
+    console.error(`Failed to scan ${domain}: ${error}`);
+    return;
+  }
+  
+  switch (format.toLowerCase()) {
+    case 'json':
+      console.log(JSON.stringify(result, null, 2));
+      break;
+      
+    case 'csv':
+      // Print CSV header if this is the first result
+      if (!handleStdoutOutput.headerPrinted) {
+        console.log('domain,resource_url,resource_type,is_external');
+        handleStdoutOutput.headerPrinted = true;
+      }
+      
+      // Print each resource as a CSV row
+      if (resources && resources.length > 0) {
+        resources.forEach(res => {
+          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'}`);
+        });
+      } else {
+        console.log(`"${domain}","no resources found","none",0`);
+      }
+      break;
+      
+    case 'text':
+    default:
+      console.log(`Domain: ${domain}`);
+      console.log(`Final URL: ${finalUrl}`);
+      console.log(`Resources: ${resources ? resources.length : 0}`);
+      
+      if (resources && resources.length > 0) {
+        console.log('\nResource List:');
+        resources.forEach(res => {
+          console.log(`- [${res.type}] ${res.isExternal ? 'EXTERNAL' : 'INTERNAL'}: ${res.url}`);
+        });
+      } else {
+        console.log('No resources found.');
+      }
+      console.log('-------------------------------------------');
+      break;
+  }
+}
+// Static property to track if CSV header has been printed
+handleStdoutOutput.headerPrinted = false;
+
 /*
  * main function with two queues: scanQueue & dbQueue
  */
@@ -328,6 +384,8 @@ async function main() {
   const captureTypes = opts.captureTypes || 'script';
   const externalOnly = opts.externalOnly !== 'false';
   const blockTypes = opts.blockTypes ? opts.blockTypes.split(',').map(t => t.trim()) : ['image', 'font', 'media'];
+  const useStdout = !!opts.stdout;
+  const outputFormat = opts.outputFormat || 'json';
   
   // Log configuration
   logger.info({
@@ -338,10 +396,13 @@ async function main() {
     blockTypes,
     concurrency,
     poolSize,
-    maxRetries
+    maxRetries,
+    useStdout,
+    outputFormat
   });
 
-  const db = initDb(opts.db);
+  // Initialize DB only if not using stdout
+  const db = useStdout ? null : initDb(opts.db);
   const processedDomains = loadCheckpoint();
 
   // Create DB handlers with the logger
@@ -355,9 +416,9 @@ async function main() {
 
   // We might run single-domain or file-based
   if (opts.domain) {
-    if (processedDomains.has(opts.domain)) {
+    if (!useStdout && processedDomains.has(opts.domain)) {
       logger.info(`Domain ${opts.domain} is already processed; skipping.`);
-      db.close();
+      if (db) db.close();
       return;
     }
     logger.info(`Scanning single domain: ${opts.domain}`);
@@ -368,15 +429,21 @@ async function main() {
     scanQueue.add(async () => {
       const scanOptions = { captureAll, captureTypes, externalOnly };
       const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
-      // Now queue the DB update
-      await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
+      
+      if (useStdout) {
+        // Output to stdout instead of DB
+        handleStdoutOutput(result, outputFormat);
+      } else {
+        // Store in DB
+        await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
+      }
     });
 
     await scanQueue.onIdle();
-    // Wait until DB jobs are done
-    await dbQueue.onIdle();
+    // Wait until DB jobs are done if not using stdout
+    if (!useStdout) await dbQueue.onIdle();
     await browserPool.close();
-    db.close();
+    if (db) db.close();
     logger.info('Single-domain scan complete.');
     return;
   }
@@ -384,12 +451,12 @@ async function main() {
   // Otherwise, multi-domain
   if (!opts.input) {
     logger.error('Must specify --input <file> or --domain <domain>.');
-    db.close();
+    if (db) db.close();
     process.exit(1);
   }
   if (!fs.existsSync(opts.input)) {
     logger.error(`Input file not found: ${opts.input}`);
-    db.close();
+    if (db) db.close();
     process.exit(1);
   }
 
@@ -397,6 +464,7 @@ async function main() {
   await browserPool.init();
 
   let totalCount = 0;
+  let processedCount = 0;
 
   const rl = readline.createInterface({
     input: fs.createReadStream(opts.input),
@@ -408,32 +476,52 @@ async function main() {
     if (!domain) continue;
     totalCount++;
 
-    if (processedDomains.has(domain)) {
-      continue; // skip
+    if (!useStdout && processedDomains.has(domain)) {
+      continue; // skip already processed domains only when using DB
     }
 
     // Add a scanning job to scanQueue
     scanQueue.add(async () => {
       const scanOptions = { captureAll, captureTypes, externalOnly };
       const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
-      // Then enqueue a DB job
-      await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
+      
+      if (useStdout) {
+        // Output to stdout
+        handleStdoutOutput(result, outputFormat);
+        processedCount++;
+      } else {
+        // Store in DB
+        await dbQueue.add(() => handleDbWrite(db, result, processedDomains, writeCheckpoint));
+      }
     });
   }
 
   await scanQueue.onIdle();  // Wait for all scanning to finish
-  await dbQueue.onIdle();    // Wait for all DB writes to finish
+  
+  // Wait for all DB writes to finish if not using stdout
+  if (!useStdout) {
+    await dbQueue.onIdle();
+  }
 
   await browserPool.close();
-  db.close();
+  if (db) db.close();
 
-  logger.info(`
+  if (useStdout) {
+    logger.info(`
+===== SCAN COMPLETE =====
+Total domains in file:       ${totalCount}
+Domains processed:           ${processedCount}
+Output format:               ${outputFormat}
+`);
+  } else {
+    logger.info(`
 ===== SCAN COMPLETE =====
 Total domains in file:       ${totalCount}
 Total domains in checkpoint: ${processedDomains.size}
 Database path:               ${opts.db}
 Checkpoint file:             ${opts.checkpoint}
 `);
+  }
 }
 
 main().catch((err) => {

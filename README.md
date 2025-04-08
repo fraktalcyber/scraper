@@ -161,12 +161,16 @@ Options:
   --capture-all                Capture all resource types
   --external-only <boolean>    Only capture resources from external domains (default: true)
   --block-types <types>        Comma-separated list of resource types to block (default: "image,font,media")
+  --stdout                     Output results to stdout instead of the database
+  --output-format <format>     Format for stdout output: json, csv, or text (default: "json")
   -h, --help                   Display help information
 ```
 
-### Resource Capture Examples
+### Usage Examples
 
 ```bash
+# Resource Capture Examples
+
 # Capture both scripts and stylesheets
 node scan-domains-playwright.js --domain example.com --capture-types "script,stylesheet"
 
@@ -178,6 +182,23 @@ node scan-domains-playwright.js --domain example.com --external-only false
 
 # Block only images when scanning
 node scan-domains-playwright.js --domain example.com --block-types "image"
+
+# Output Examples
+
+# Output to stdout in JSON format instead of saving to database
+node scan-domains-playwright.js --domain example.com --stdout
+
+# Output to stdout in CSV format
+node scan-domains-playwright.js --domain example.com --stdout --output-format csv
+
+# Output to stdout in text format
+node scan-domains-playwright.js --domain example.com --stdout --output-format text
+
+# Pipe output to a file
+node scan-domains-playwright.js --domain example.com --stdout > results.json
+
+# Process multiple domains and output as CSV
+node scan-domains-playwright.js --input domains.txt --stdout --output-format csv > results.csv
 ```
 
 ## Architecture
