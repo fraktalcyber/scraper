@@ -1,10 +1,10 @@
 # Web Domain Scanner
 
-A high-performance, concurrent web scraper for extracting external JavaScript sources from websites.
+A high-performance, concurrent web scraper for extracting external resources from websites.
 
 ## Overview
 
-This tool visits websites and identifies all external JavaScript resources loaded by each domain. It's optimized for:
+This tool visits websites and identifies external resources loaded by each domain. It can capture various resource types including scripts, stylesheets, XHR, fetch requests, and more. It's optimized for:
 
 - **Bulk scanning**: Process thousands of domains from input files
 - **Concurrency**: Configurable browser and DB task parallelization
@@ -15,9 +15,11 @@ For more details, see the related blog post: [Examining External Dependencies in
 
 ## Features
 
+- **Flexible resource capture**: Collect scripts, stylesheets, XHR, fetch requests, images, and more
+- **Configurable filtering**: Choose between external-only or all resources 
 - **Browser automation**: Uses Playwright for headless Chrome browsing
 - **Optimized browser pool**: Reuses browser contexts to reduce memory usage
-- **Resource blocking**: Prevents unnecessary resource loading for speed
+- **Resource blocking**: Configurable blocking of unnecessary resources (images, fonts, etc.) for speed
 - **Database storage**: Persistent SQLite storage with transaction support
 - **Checkpointing**: Resume interrupted scans from last successful position
 - **Upsert logic**: Domain uniqueness with automatic overwrite of previous scans
@@ -146,15 +148,36 @@ The batch script is recommended for large scans as it breaks input into chunks a
 
 ```
 Options:
-  -i, --input <file>        File containing domains, one per line
-  -d, --domain <domain>     Single domain to scan (ignore --input)
-  --db <file>               SQLite DB file (default: ./results.db)
-  -c, --checkpoint <file>   Checkpoint file (default: ./checkpoint.json)
-  --resume                  Resume from existing checkpoint
-  --concurrency <number>    Number of concurrent scanning tasks (default: 5)
-  --pool-size <number>      Number of browser contexts to reuse (default: 5)
-  --max-retries <number>    Number of retries for a failing domain (default: 3)
-  -h, --help                Display help information
+  -i, --input <file>           File containing domains, one per line
+  -d, --domain <domain>        Single domain to scan (ignore --input)
+  --db <file>                  SQLite DB file (default: ./results.db)
+  -c, --checkpoint <file>      Checkpoint file (default: ./checkpoint.json)
+  --resume                     Resume from existing checkpoint
+  --concurrency <number>       Number of concurrent scanning tasks (default: 5)
+  --pool-size <number>         Number of browser contexts to reuse (default: 5)
+  --max-retries <number>       Number of retries for a failing domain (default: 3)
+  --capture-types <types>      Comma-separated list of resource types to capture (default: "script")
+                               Available types: script,stylesheet,fetch,xhr,image,font,media,websocket,manifest,other
+  --capture-all                Capture all resource types
+  --external-only <boolean>    Only capture resources from external domains (default: true)
+  --block-types <types>        Comma-separated list of resource types to block (default: "image,font,media")
+  -h, --help                   Display help information
+```
+
+### Resource Capture Examples
+
+```bash
+# Capture both scripts and stylesheets
+node scan-domains-playwright.js --domain example.com --capture-types "script,stylesheet"
+
+# Capture all resource types
+node scan-domains-playwright.js --domain example.com --capture-all
+
+# Include internal resources (same domain)
+node scan-domains-playwright.js --domain example.com --external-only false
+
+# Block only images when scanning
+node scan-domains-playwright.js --domain example.com --block-types "image"
 ```
 
 ## Architecture
@@ -177,10 +200,12 @@ The SQLite database contains two tables:
 - `error`: TEXT (error message if scan failed)
 - `scannedAt`: DATETIME (timestamp of scan)
 
-### `externalScripts`
+### `resources`
 - `id`: Integer primary key
 - `scanId`: INTEGER (foreign key to scans.id)
-- `scriptUrl`: TEXT (URL of the external script)
+- `url`: TEXT (URL of the resource)
+- `resourceType`: TEXT (type of resource: script, stylesheet, image, etc.)
+- `isExternal`: INTEGER (1=external domain, 0=same domain)
 
 ## Troubleshooting
 
