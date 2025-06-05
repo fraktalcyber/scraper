@@ -67,6 +67,7 @@ program
   .option('--screenshot-full-page', 'Capture full page screenshots, not just viewport')
   .option('--wait-until <state>', 'When to consider navigation complete: domcontentloaded, load, networkidle', 'domcontentloaded')
   .option('--check-sri', 'Check for Subresource Integrity (SRI) attributes on scripts and stylesheets')
+  .option('--track-dependencies', 'Track resource dependencies to identify fourth-party resources')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -230,11 +231,491 @@ async function scanDomain(domain, browserPool, maxRetries = 3, options = {}) {
               checked: true,
               resourcesWithoutSri: { scripts: [], stylesheets: [] }
             }
+          }),
+          ...(options.trackDependencies && {
+            dependencies: {
+              checked: true,
+              tree: {
+                firstParty: [],
+                thirdParty: {},
+                fourthParty: {}
+              }
+            }
           })
         };
       }
     }
   }
+}
+
+/**
+ * Tracks resource dependencies to identify fourth-party resources
+ */
+async function trackResourceDependencies(page, domain, captureTypes = null) {
+  // Initialize structure to hold request data
+  const requests = [];
+  const domainToResources = new Map();
+  const resourceTiming = new Map();
+  const domCreators = new Map(); // Maps URLs to info about scripts that created them
+  const dependencyTree = {
+    firstParty: [],
+    thirdParty: {}, // Map of third-party domains to their resources
+    fourthParty: {}, // Map of third-party to fourth-party domains and resources
+    dynamicCreation: {} // Maps resources to the scripts that created them
+  };
+  
+  // Track all network requests with timing
+  const startTime = Date.now();
+  
+  // Inject script to monitor DOM mutations for script/resource creation
+  await page.addInitScript(() => {
+    // Store which script created which resource
+    window.__resourceCreators = new Map();
+    window.__pendingElements = new Set();
+    
+    // Helper to get a simplified stack trace
+    function getCallerInfo() {
+      const error = new Error();
+      const stack = error.stack || '';
+      const lines = stack.split('\n').slice(3); // Skip the Error and helper function frames
+      
+      // Extract URLs from the stack trace
+      const scriptUrls = [];
+      for (const line of lines) {
+        const urlMatch = line.match(/https?:\/\/[^:)]+/);
+        if (urlMatch) {
+          const url = urlMatch[0];
+          // Don't include the current page URL
+          if (url !== window.location.href) {
+            scriptUrls.push(url);
+          }
+        }
+      }
+      
+      return {
+        timestamp: Date.now(),
+        scriptUrls: scriptUrls.length > 0 ? scriptUrls : ['inline-script-or-event-handler']
+      };
+    }
+    
+    // Watch for dynamically added scripts and resources
+    const observer = new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'childList') {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              let url = null;
+              
+              // Handle different resource types
+              if (node.tagName === 'SCRIPT' && node.src) {
+                url = node.src;
+              } else if (node.tagName === 'LINK' && node.rel === 'stylesheet' && node.href) {
+                url = node.href;
+              } else if (node.tagName === 'IMG' && node.src) {
+                url = node.src;
+              } else if (node.tagName === 'IFRAME' && node.src) {
+                url = node.src;
+              }
+              
+              if (url) {
+                const info = getCallerInfo();
+                window.__resourceCreators.set(url, info);
+                
+                // Track elements that haven't loaded yet
+                window.__pendingElements.add(url);
+                
+                // Listen for load/error events to update status
+                const markLoaded = () => {
+                  window.__pendingElements.delete(url);
+                  if (node.removeEventListener) {
+                    node.removeEventListener('load', markLoaded);
+                    node.removeEventListener('error', markLoaded);
+                  }
+                };
+                
+                if (node.addEventListener) {
+                  node.addEventListener('load', markLoaded);
+                  node.addEventListener('error', markLoaded);
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    observer.observe(document, { childList: true, subtree: true });
+    
+    // Intercept document.write and similar methods
+    const originalWrite = document.write;
+    document.write = function(...args) {
+      const info = getCallerInfo();
+      if (!window.__documentWrites) {
+        window.__documentWrites = [];
+      }
+      window.__documentWrites.push({
+        content: args.join(''),
+        info
+      });
+      return originalWrite.apply(this, args);
+    };
+    
+    // Intercept createElement + appendChild pattern
+    const originalCreateElement = document.createElement;
+    document.createElement = function(tagName) {
+      const element = originalCreateElement.apply(this, arguments);
+      const info = getCallerInfo();
+      
+      // Tag the element with creator info
+      element.__creatorInfo = info;
+      
+      // Intercept setting src/href attributes
+      if (element.tagName === 'SCRIPT' || element.tagName === 'LINK' || 
+          element.tagName === 'IMG' || element.tagName === 'IFRAME') {
+        
+        const descriptors = {
+          src: Object.getOwnPropertyDescriptor(element.__proto__, 'src'),
+          href: Object.getOwnPropertyDescriptor(element.__proto__, 'href')
+        };
+        
+        // Handle src attribute
+        if (descriptors.src) {
+          Object.defineProperty(element, 'src', {
+            get: function() {
+              return descriptors.src.get.call(this);
+            },
+            set: function(value) {
+              const result = descriptors.src.set.call(this, value);
+              if (value) {
+                window.__resourceCreators.set(value, element.__creatorInfo || getCallerInfo());
+              }
+              return result;
+            }
+          });
+        }
+        
+        // Handle href attribute
+        if (descriptors.href) {
+          Object.defineProperty(element, 'href', {
+            get: function() {
+              return descriptors.href.get.call(this);
+            },
+            set: function(value) {
+              const result = descriptors.href.set.call(this, value);
+              if (value && element.rel === 'stylesheet') {
+                window.__resourceCreators.set(value, element.__creatorInfo || getCallerInfo());
+              }
+              return result;
+            }
+          });
+        }
+      }
+      
+      return element;
+    };
+  });
+  
+  // Listen for all requests and collect their order and timing
+  page.on('request', request => {
+    try {
+      const url = request.url();
+      const timestamp = Date.now() - startTime;
+      const resourceType = request.resourceType();
+      
+      // Skip data URLs
+      if (url.startsWith('data:')) return;
+      
+      // If captureTypes is specified, only track those resource types
+      if (captureTypes && !captureTypes.includes(resourceType)) {
+        return;
+      }
+      
+      // Add to requests list
+      requests.push({
+        url,
+        timestamp,
+        resourceType
+      });
+      
+      // Track timing
+      resourceTiming.set(url, timestamp);
+      
+      // Group by domain
+      try {
+        const resourceDomain = new URL(url).hostname;
+        if (!domainToResources.has(resourceDomain)) {
+          domainToResources.set(resourceDomain, []);
+        }
+        domainToResources.get(resourceDomain).push({
+          url,
+          timestamp,
+          resourceType
+        });
+      } catch (e) {
+        // Skip invalid URLs
+      }
+    } catch (e) {
+      // Skip any errors in request tracking
+    }
+  });
+  
+  // Add a completion handler to build the dependency tree after page load
+  return {
+    buildDependencyTree: async () => {
+      // Get base domain from primary domain
+      let baseDomain = new URL(domain.startsWith('http') ? domain : `https://${domain}`).hostname;
+      
+      // Normalize domain name (remove 'www.' prefix if present)
+      const normalizedBaseDomain = baseDomain.replace(/^www\./, '');
+      
+      // Function to check if a domain is the same as the base domain (with www. normalization)
+      const isSameAsBaseDomain = (testDomain) => {
+        const normalizedTestDomain = testDomain.replace(/^www\./, '');
+        return normalizedTestDomain === normalizedBaseDomain;
+      };
+      
+      // Sort all requests by timestamp
+      requests.sort((a, b) => a.timestamp - b.timestamp);
+      
+      // Retrieve DOM creation data
+      const domCreationInfo = await page.evaluate(() => {
+        return {
+          resourceCreators: Array.from(window.__resourceCreators || new Map()).map(([url, info]) => ({
+            url,
+            createdBy: info.scriptUrls,
+            timestamp: info.timestamp
+          })),
+          documentWrites: window.__documentWrites || []
+        };
+      });
+      
+      // Process DOM creation info
+      domCreationInfo.resourceCreators.forEach(item => {
+        domCreators.set(item.url, item);
+      });
+      
+      // Identify first-party and third-party resources
+      for (const [resourceDomain, resources] of domainToResources.entries()) {
+        if (isSameAsBaseDomain(resourceDomain)) {
+          // This is a first-party resource
+          dependencyTree.firstParty = [...resources];
+        } else {
+          // This is a third-party resource
+          dependencyTree.thirdParty[resourceDomain] = [...resources];
+        }
+      }
+      
+      // Identify potential fourth-party resources by analyzing load order and DOM creation
+      // A resource is likely a fourth-party if it loads shortly after a third-party resource
+      // or if DOM tracking confirms it was created by a third-party script
+      const DEPENDENCY_THRESHOLD_MS = 300; // Reduced time window to minimize false positives
+      
+      // First pass: Use DOM creation information to establish high-confidence dependencies
+      const confirmedFourthPartyByThirdParty = new Map();
+      
+      // Start by processing the DOM creation info for confirmed relationships
+      domCreationInfo.resourceCreators.forEach(item => {
+        try {
+          // Skip if URL is malformed or it's a data URL
+          const url = new URL(item.url);
+          if (url.href.startsWith('data:')) return;
+          
+          // Skip first-party resources
+          const resourceDomain = url.hostname;
+          if (isSameAsBaseDomain(resourceDomain)) return;
+          
+          // Check if this resource was created by a third-party script
+          if (item.createdBy && item.createdBy.length > 0 && item.createdBy[0] !== 'inline-script-or-event-handler') {
+            // Try to find the third-party domain that created this resource
+            for (const creatorUrl of item.createdBy) {
+              try {
+                const creatorDomain = new URL(creatorUrl).hostname;
+                
+                // Skip if creator is first-party or same as resource
+                if (isSameAsBaseDomain(creatorDomain) || creatorDomain === resourceDomain) continue;
+                
+                // We found a third-party to fourth-party relationship
+                if (!confirmedFourthPartyByThirdParty.has(creatorDomain)) {
+                  confirmedFourthPartyByThirdParty.set(creatorDomain, new Map());
+                }
+                
+                const fourthPartyMap = confirmedFourthPartyByThirdParty.get(creatorDomain);
+                if (!fourthPartyMap.has(resourceDomain)) {
+                  fourthPartyMap.set(resourceDomain, []);
+                }
+                
+                // Find the resource in our requests list to get full details
+                const resourceDetail = requests.find(req => req.url === item.url);
+                if (resourceDetail) {
+                  fourthPartyMap.get(resourceDomain).push({
+                    ...resourceDetail,
+                    possibleParent: creatorUrl,
+                    createdBy: item.createdBy,
+                    creationConfidence: 'high' // DOM-confirmed
+                  });
+                }
+                
+                break; // We found a creator, no need to check others
+              } catch (e) {
+                // Skip invalid creator URLs
+                continue;
+              }
+            }
+          }
+        } catch (e) {
+          // Skip invalid URLs
+        }
+      });
+      
+      // Second pass: Use timing information for medium-confidence dependencies
+      for (const thirdPartyDomain in dependencyTree.thirdParty) {
+        const thirdPartyResources = dependencyTree.thirdParty[thirdPartyDomain];
+        dependencyTree.fourthParty[thirdPartyDomain] = {};
+        
+        // First add any confirmed fourth-party resources for this third-party
+        if (confirmedFourthPartyByThirdParty.has(thirdPartyDomain)) {
+          const confirmedFourthParties = confirmedFourthPartyByThirdParty.get(thirdPartyDomain);
+          for (const [fourthPartyDomain, resources] of confirmedFourthParties.entries()) {
+            dependencyTree.fourthParty[thirdPartyDomain][fourthPartyDomain] = [...resources];
+          }
+        }
+        
+        // Then use timing information for additional potential dependencies
+        for (const thirdPartyResource of thirdPartyResources) {
+          // Look for resources loaded shortly after this third-party resource
+          const potentialDependencies = requests.filter(req => {
+            try {
+              const reqDomain = new URL(req.url).hostname;
+              
+              // Check if the parent resource is capable of loading other resources
+              // Files like images, videos, fonts typically don't load other resources
+              const parentType = thirdPartyResource.resourceType;
+              const parentUrl = thirdPartyResource.url;
+              const isParentCapable = 
+                parentType === 'script' || 
+                parentType === 'document' || 
+                parentType === 'iframe' || 
+                parentType === 'xhr' || 
+                parentType === 'fetch';
+                
+              // Check if parent URL is a non-executable media file
+              const parentIsMedia = /\.(jpg|jpeg|png|gif|webp|mp4|webm|ogg|mp3|wav|pdf|woff|woff2|ttf|eot)$/i.test(parentUrl);
+              
+              return (
+                reqDomain !== thirdPartyDomain && // Not the same third-party
+                !isSameAsBaseDomain(reqDomain) && // Not first-party
+                req.timestamp > thirdPartyResource.timestamp && // Loaded after
+                req.timestamp < thirdPartyResource.timestamp + DEPENDENCY_THRESHOLD_MS && // Within time threshold
+                req.timestamp - thirdPartyResource.timestamp >= 5 && // At least 5ms difference to avoid coincidental loads
+                isParentCapable && // Parent resource must be capable of loading other resources
+                !parentIsMedia // Parent is not a media file
+              );
+            } catch (e) {
+              return false;
+            }
+          });
+          
+          // Group potential timing-based dependencies by domain
+          for (const dependency of potentialDependencies) {
+            try {
+              const dependencyDomain = new URL(dependency.url).hostname;
+              
+              // Skip domain resources loaded by third-parties - these are still first-party resources
+              // They should appear in the first-party section, not as fourth-party
+              if (isSameAsBaseDomain(dependencyDomain)) {
+                // Add to first-party if not already there
+                const alreadyInFirstParty = dependencyTree.firstParty.some(
+                  r => r.url === dependency.url
+                );
+                
+                if (!alreadyInFirstParty) {
+                  dependencyTree.firstParty.push(dependency);
+                }
+                continue;
+              }
+              
+              // Skip if we already have a confirmed high-confidence relationship for this resource
+              const confirmedFourthParties = confirmedFourthPartyByThirdParty.get(thirdPartyDomain);
+              if (confirmedFourthParties && 
+                  confirmedFourthParties.has(dependencyDomain) && 
+                  confirmedFourthParties.get(dependencyDomain).some(r => r.url === dependency.url)) {
+                continue;
+              }
+              
+              // Handle timing-based fourth-party resources (not from base domain)
+              if (!dependencyTree.fourthParty[thirdPartyDomain][dependencyDomain]) {
+                dependencyTree.fourthParty[thirdPartyDomain][dependencyDomain] = [];
+              }
+              
+              // Check if we have DOM creation info for this dependency
+              const creationInfo = domCreators.get(dependency.url);
+              const enhancedDependency = {
+                ...dependency,
+                possibleParent: thirdPartyResource.url
+              };
+              
+              // If we have DOM creation info, use it
+              if (creationInfo) {
+                enhancedDependency.createdBy = creationInfo.createdBy;
+                enhancedDependency.creationConfidence = 'high'; // DOM-detected
+              } else {
+                enhancedDependency.creationConfidence = 'medium'; // Timing-inferred
+              }
+              
+              dependencyTree.fourthParty[thirdPartyDomain][dependencyDomain].push(enhancedDependency);
+            } catch (e) {
+              // Skip invalid URLs
+            }
+          }
+        }
+        
+        // Remove empty fourth-party entries
+        if (Object.keys(dependencyTree.fourthParty[thirdPartyDomain]).length === 0) {
+          delete dependencyTree.fourthParty[thirdPartyDomain];
+        }
+      }
+      
+      // Add direct DOM creation info to the tree
+      dependencyTree.dynamicCreation = {};
+      domCreationInfo.resourceCreators.forEach(item => {
+        try {
+          // Skip if URL is malformed
+          const url = new URL(item.url);
+          // Only include if it's not a data URL
+          if (!url.href.startsWith('data:')) {
+            dependencyTree.dynamicCreation[item.url] = {
+              createdBy: item.createdBy,
+              timestamp: item.timestamp
+            };
+            
+            // If this is a first-party resource loaded by third-party script,
+            // ensure it appears in the first-party resources list
+            if (isSameAsBaseDomain(url.hostname)) {
+              const resourceType = item.url.endsWith('.js') ? 'script' : 
+                                 item.url.endsWith('.css') ? 'stylesheet' : 'other';
+                                 
+              // Add to first-party if not already there
+              const alreadyInFirstParty = dependencyTree.firstParty.some(
+                r => r.url === item.url
+              );
+              
+              if (!alreadyInFirstParty) {
+                dependencyTree.firstParty.push({
+                  url: item.url,
+                  timestamp: item.timestamp,
+                  resourceType
+                });
+              }
+            }
+          }
+        } catch (e) {
+          // Skip invalid URLs
+        }
+      });
+      
+      return dependencyTree;
+    }
+  };
 }
 
 /**
@@ -303,6 +784,7 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
   
   // Parse security check options
   const checkSri = options.checkSri || false;
+  const trackDependencies = options.trackDependencies || false;
 
   const context = await browserPool.acquireContext();
   const page = await context.newPage();
@@ -333,6 +815,14 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
       if (set) set.add(req.url());
     }
   });
+  
+  // Set up dependency tracking if enabled
+  let dependencyTracker = null;
+  if (trackDependencies) {
+    // If capture types are specified, use them for dependency tracking too
+    const typesToTrack = captureAll ? RESOURCE_TYPES : captureTypes;
+    dependencyTracker = await trackResourceDependencies(page, domain, typesToTrack);
+  }
 
   try {
     logger.info(`Navigating to ${finalUrlToVisit} with waitUntil: ${waitUntil}`);
@@ -352,6 +842,27 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
         domain,
         scriptsWithoutSri: resourcesWithoutSri.scripts.length,
         stylesheetsWithoutSri: resourcesWithoutSri.stylesheets.length
+      });
+    }
+    
+    // Process dependency information if enabled
+    let dependencyResults = null;
+    if (trackDependencies && dependencyTracker) {
+      dependencyResults = await dependencyTracker.buildDependencyTree();
+      
+      // Log a summary of the dependency tree
+      const thirdPartyDomains = Object.keys(dependencyResults.thirdParty);
+      const fourthPartyDomains = new Set();
+      Object.values(dependencyResults.fourthParty).forEach(domains => {
+        Object.keys(domains).forEach(domain => fourthPartyDomains.add(domain));
+      });
+      
+      logger.info({
+        msg: 'Dependency results',
+        domain,
+        firstPartyResources: dependencyResults.firstParty.length,
+        thirdPartyDomains: thirdPartyDomains.length,
+        fourthPartyDomains: fourthPartyDomains.size
       });
     }
     
@@ -435,6 +946,12 @@ async function doPlaywrightScan(domain, browserPool, options = {}) {
           checked: true,
           resourcesWithoutSri
         }
+      }),
+      ...(dependencyResults && {
+        dependencies: {
+          checked: true,
+          tree: dependencyResults
+        }
       })
     };
   } catch (err) {
@@ -463,7 +980,7 @@ function handleStdoutOutput(result, format = 'json') {
     case 'csv':
       // Print CSV header if this is the first result
       if (!handleStdoutOutput.headerPrinted) {
-        console.log('domain,resource_url,resource_type,is_external,screenshot_path,has_sri');
+        console.log('domain,resource_url,resource_type,is_external,screenshot_path,has_sri,dependency_level,parent_resource');
         handleStdoutOutput.headerPrinted = true;
       }
       
@@ -485,10 +1002,84 @@ function handleStdoutOutput(result, format = 'json') {
             }
           }
           
-          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'},"${result.screenshotPath || ''}","${hasSri}"`);
+          // Determine dependency level
+          let dependencyLevel = "firstParty";
+          let parentResource = "";
+          
+          if (result.dependencies) {
+            const tree = result.dependencies.tree;
+            
+            // Check if it's a first-party resource
+            const isFirstParty = tree.firstParty.some(r => r.url === res.url);
+            
+            if (!isFirstParty) {
+              // Check if it's in any third-party domain
+              let foundThirdParty = false;
+              for (const thirdPartyDomain in tree.thirdParty) {
+                if (tree.thirdParty[thirdPartyDomain].some(r => r.url === res.url)) {
+                  dependencyLevel = "thirdParty";
+                  foundThirdParty = true;
+                  break;
+                }
+              }
+              
+              // If not found in third-party, check fourth-party
+              if (!foundThirdParty) {
+                for (const thirdPartyDomain in tree.fourthParty) {
+                  for (const fourthPartyDomain in tree.fourthParty[thirdPartyDomain]) {
+                    const matchingResource = tree.fourthParty[thirdPartyDomain][fourthPartyDomain]
+                      .find(r => r.url === res.url);
+                    
+                    if (matchingResource) {
+                      dependencyLevel = "fourthParty";
+                      parentResource = matchingResource.possibleParent || "";
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          console.log(`"${domain}","${res.url}","${res.type}",${res.isExternal ? '1' : '0'},"${result.screenshotPath || ''}","${hasSri}","${dependencyLevel}","${parentResource}"`);
         });
         
-        // Also add SRI-missing resources that might not be in the regular resources list
+        // Add additional resources that might only be in the dependency tree
+        if (result.dependencies) {
+          const tree = result.dependencies.tree;
+          const reportedUrls = new Set(resources.map(r => r.url));
+          
+          // Add all resources from the dependency tree that weren't already reported
+          
+          // First-party resources
+          tree.firstParty.forEach(resource => {
+            if (!reportedUrls.has(resource.url)) {
+              console.log(`"${domain}","${resource.url}","${resource.resourceType}",0,"${result.screenshotPath || ''}","N/A","firstParty",""`);
+            }
+          });
+          
+          // Third-party resources
+          for (const thirdPartyDomain in tree.thirdParty) {
+            tree.thirdParty[thirdPartyDomain].forEach(resource => {
+              if (!reportedUrls.has(resource.url)) {
+                console.log(`"${domain}","${resource.url}","${resource.resourceType}",1,"${result.screenshotPath || ''}","N/A","thirdParty",""`);
+              }
+            });
+          }
+          
+          // Fourth-party resources
+          for (const thirdPartyDomain in tree.fourthParty) {
+            for (const fourthPartyDomain in tree.fourthParty[thirdPartyDomain]) {
+              tree.fourthParty[thirdPartyDomain][fourthPartyDomain].forEach(resource => {
+                if (!reportedUrls.has(resource.url)) {
+                  console.log(`"${domain}","${resource.url}","${resource.resourceType}",1,"${result.screenshotPath || ''}","N/A","fourthParty","${resource.possibleParent}"`);
+                }
+              });
+            }
+          }
+        }
+        
+        // Also add SRI-missing resources that might not be in any list yet
         if (result.sri) {
           const allSriMissing = [
             ...result.sri.resourcesWithoutSri.scripts,
@@ -500,11 +1091,11 @@ function handleStdoutOutput(result, format = 'json') {
           const missingOnlySri = allSriMissing.filter(item => !reportedUrls.has(item.src));
           
           missingOnlySri.forEach(item => {
-            console.log(`"${domain}","${item.src}","${item.element}",1,"${result.screenshotPath || ''}","0"`);
+            console.log(`"${domain}","${item.src}","${item.element}",1,"${result.screenshotPath || ''}","0","unknown",""`);
           });
         }
       } else {
-        console.log(`"${domain}","no resources found","none",0,"${result.screenshotPath || ''}","N/A"`);
+        console.log(`"${domain}","no resources found","none",0,"${result.screenshotPath || ''}","N/A","none",""`);
       }
       break;
       
@@ -536,6 +1127,72 @@ function handleStdoutOutput(result, format = 'json') {
           result.sri.resourcesWithoutSri.stylesheets.forEach(stylesheet => {
             console.log(`  - [stylesheet] ${stylesheet.src}`);
           });
+        }
+      }
+
+      // Print dependency information
+      if (result.dependencies) {
+        const tree = result.dependencies.tree;
+        const thirdPartyDomains = Object.keys(tree.thirdParty);
+        const fourthPartyCount = Object.values(tree.fourthParty)
+          .reduce((total, domains) => total + Object.keys(domains).length, 0);
+        
+        console.log(`\nResource Dependency Analysis:`);
+        console.log(`- First-party resources: ${tree.firstParty.length}`);
+        console.log(`- Third-party domains: ${thirdPartyDomains.length}`);
+        console.log(`- Fourth-party domains: ${fourthPartyCount}`);
+        
+        if (thirdPartyDomains.length > 0) {
+          console.log(`\nDependency Tree:`);
+          
+          // Print first party domain
+          console.log(`└── First Party (${domain})`);
+          if (tree.firstParty.length > 0) {
+            tree.firstParty.slice(0, 5).forEach(resource => {
+              console.log(`    ├── ${resource.resourceType}: ${resource.url}`);
+            });
+            if (tree.firstParty.length > 5) {
+              console.log(`    └── ... ${tree.firstParty.length - 5} more resources`);
+            }
+          }
+          
+          // Print third party domains
+          for (const [idx, thirdPartyDomain] of thirdPartyDomains.entries()) {
+            const isLast = idx === thirdPartyDomains.length - 1;
+            const thirdPartyResources = tree.thirdParty[thirdPartyDomain];
+            
+            console.log(`\n${isLast ? '└' : '├'}── Third Party: ${thirdPartyDomain} (${thirdPartyResources.length} resources)`);
+            
+            // Show a few sample resources from this third party
+            thirdPartyResources.slice(0, 3).forEach(resource => {
+              console.log(`    ├── ${resource.resourceType}: ${resource.url.substring(0, 100)}${resource.url.length > 100 ? '...' : ''}`);
+            });
+            
+            if (thirdPartyResources.length > 3) {
+              console.log(`    └── ... ${thirdPartyResources.length - 3} more resources`);
+            }
+            
+            // Check if this third party has fourth party dependencies
+            const fourthParties = tree.fourthParty[thirdPartyDomain];
+            if (fourthParties && Object.keys(fourthParties).length > 0) {
+              console.log(`    └── Fourth Party Dependencies:`);
+              
+              Object.entries(fourthParties).forEach(([fourthPartyDomain, resources], fIdx, fArr) => {
+                const fIsLast = fIdx === fArr.length - 1;
+                console.log(`        ${fIsLast ? '└' : '├'}── ${fourthPartyDomain} (${resources.length} resources)`);
+                
+                resources.slice(0, 2).forEach((resource, rIdx, rArr) => {
+                  const rIsLast = rIdx === rArr.length - 1 && resources.length <= 2;
+                  console.log(`            ${rIsLast ? '└' : '├'}── ${resource.resourceType}: ${resource.url.substring(0, 80)}${resource.url.length > 80 ? '...' : ''}`);
+                  console.log(`            ${rIsLast ? ' ' : '|'}   └── Likely loaded by: ${resource.possibleParent.substring(0, 60)}${resource.possibleParent.length > 60 ? '...' : ''}`);
+                });
+                
+                if (resources.length > 2) {
+                  console.log(`            └── ... ${resources.length - 2} more resources`);
+                }
+              });
+            }
+          }
         }
       }
       
@@ -585,6 +1242,7 @@ async function main() {
   
   // Security check options
   const checkSri = !!opts.checkSri;
+  const trackDependencies = !!opts.trackDependencies;
   
   // Ensure screenshot directory exists if needed
   if (takeScreenshot) {
@@ -610,7 +1268,8 @@ async function main() {
       fullPageScreenshot
     }),
     waitUntil,
-    checkSri
+    checkSri,
+    trackDependencies
   });
 
   // Initialize DB only if not using stdout
@@ -648,7 +1307,8 @@ async function main() {
         screenshotPath,
         fullPageScreenshot,
         waitUntil,
-        checkSri
+        checkSri,
+        trackDependencies
       };
       const result = await scanDomain(opts.domain, browserPool, maxRetries, scanOptions);
       
@@ -713,7 +1373,8 @@ async function main() {
         screenshotPath,
         fullPageScreenshot,
         waitUntil,
-        checkSri
+        checkSri,
+        trackDependencies
       };
       const result = await scanDomain(domain, browserPool, maxRetries, scanOptions);
       

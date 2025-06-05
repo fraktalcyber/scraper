@@ -169,6 +169,7 @@ Options:
   --screenshot-full-page       Capture full page screenshots, not just viewport
   --wait-until <state>         When to consider navigation complete: domcontentloaded, load, networkidle (default: "domcontentloaded")
   --check-sri                  Check for Subresource Integrity (SRI) attributes on scripts and stylesheets
+  --track-dependencies         Track resource dependencies to identify fourth-party resources
   -h, --help                   Display help information
 ```
 
@@ -239,6 +240,17 @@ node scan-domains-playwright.js --domain example.com --check-sri --stdout --outp
 
 # Full security scan with network idle wait and SRI checking
 node scan-domains-playwright.js --domain example.com --wait-until networkidle --check-sri
+
+# Dependency Analysis
+
+# Track fourth-party dependencies
+node scan-domains-playwright.js --domain example.com --track-dependencies
+
+# Comprehensive security and dependency scan
+node scan-domains-playwright.js --domain example.com --wait-until networkidle --check-sri --track-dependencies
+
+# Export dependency information to CSV
+node scan-domains-playwright.js --domain example.com --track-dependencies --stdout --output-format csv > dependencies.csv
 ```
 
 ## Architecture
